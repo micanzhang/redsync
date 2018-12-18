@@ -1,11 +1,12 @@
 package redsync
 
 import (
+	"context"
 	"strconv"
 	"testing"
 	"time"
 
-	"github.com/gomodule/redigo/redis"
+	"github.com/opencensus-integrations/redigo/redis"
 	"github.com/stvp/tempredis"
 )
 
@@ -13,13 +14,14 @@ func TestMutex(t *testing.T) {
 	pools := newMockPools(8)
 	mutexes := newTestMutexes(pools, "test-mutex", 8)
 	orderCh := make(chan int)
+	ctx := context.Background()
 	for i, mutex := range mutexes {
 		go func(i int, mutex *Mutex) {
-			err := mutex.Lock()
+			err := mutex.Lock(ctx)
 			if err != nil {
 				t.Fatalf("Expected err == nil, got %q", err)
 			}
-			defer mutex.Unlock()
+			defer mutex.Unlock(ctx)
 
 			assertAcquired(t, pools, mutex)
 
@@ -35,17 +37,18 @@ func TestMutexExtend(t *testing.T) {
 	pools := newMockPools(8)
 	mutexes := newTestMutexes(pools, "test-mutex-extend", 1)
 	mutex := mutexes[0]
+	ctx := context.Background()
 
-	err := mutex.Lock()
+	err := mutex.Lock(ctx)
 	if err != nil {
 		t.Fatalf("Expected err == nil, got %q", err)
 	}
-	defer mutex.Unlock()
+	defer mutex.Unlock(ctx)
 
 	time.Sleep(1 * time.Second)
 
 	expiries := getPoolExpiries(pools, mutex.name)
-	ok := mutex.Extend()
+	ok := mutex.Extend(ctx)
 	if !ok {
 		t.Fatalf("Expected ok == true, got %v", ok)
 	}
@@ -60,6 +63,7 @@ func TestMutexExtend(t *testing.T) {
 
 func TestMutexQuorum(t *testing.T) {
 	pools := newMockPools(4)
+	ctx := context.Background()
 	for mask := 0; mask < 1<<uint(len(pools)); mask++ {
 		mutexes := newTestMutexes(pools, "test-mutex-partial-"+strconv.Itoa(mask), 1)
 		mutex := mutexes[0]
@@ -68,13 +72,13 @@ func TestMutexQuorum(t *testing.T) {
 		n := clogPools(pools, mask, mutex)
 
 		if n >= len(pools)/2+1 {
-			err := mutex.Lock()
+			err := mutex.Lock(ctx)
 			if err != nil {
 				t.Fatalf("Expected err == nil, got %q", err)
 			}
 			assertAcquired(t, pools, mutex)
 		} else {
-			err := mutex.Lock()
+			err := mutex.Lock(ctx)
 			if err != ErrFailed {
 				t.Fatalf("Expected err == %q, got %q", ErrFailed, err)
 			}
@@ -82,11 +86,20 @@ func TestMutexQuorum(t *testing.T) {
 	}
 }
 
+type wrapperPool struct {
+	pool *redis.Pool
+}
+
+func (p *wrapperPool) GetWithContext(ctx context.Context) redis.ConnWithContext {
+	conn := p.pool.GetWithContext(ctx)
+	return conn.(redis.ConnWithContext)
+}
+
 func newMockPools(n int) []Pool {
 	pools := []Pool{}
 	for _, server := range servers {
 		func(server *tempredis.Server) {
-			pools = append(pools, &redis.Pool{
+			pool := &redis.Pool{
 				MaxIdle:     3,
 				IdleTimeout: 240 * time.Second,
 				Dial: func() (redis.Conn, error) {
@@ -96,7 +109,8 @@ func newMockPools(n int) []Pool {
 					_, err := c.Do("PING")
 					return err
 				},
-			})
+			}
+			pools = append(pools, &wrapperPool{pool: pool})
 		}(server)
 		if len(pools) == n {
 			break
@@ -107,10 +121,11 @@ func newMockPools(n int) []Pool {
 
 func getPoolValues(pools []Pool, name string) []string {
 	values := []string{}
+	ctx := context.Background()
 	for _, pool := range pools {
-		conn := pool.Get()
-		value, err := redis.String(conn.Do("GET", name))
-		conn.Close()
+		conn := pool.GetWithContext(ctx)
+		value, err := redis.String(conn.DoContext(ctx, "GET", name))
+		conn.CloseContext(ctx)
 		if err != nil && err != redis.ErrNil {
 			panic(err)
 		}
@@ -121,10 +136,11 @@ func getPoolValues(pools []Pool, name string) []string {
 
 func getPoolExpiries(pools []Pool, name string) []int {
 	expiries := []int{}
+	ctx := context.Background()
 	for _, pool := range pools {
-		conn := pool.Get()
-		expiry, err := redis.Int(conn.Do("PTTL", name))
-		conn.Close()
+		conn := pool.GetWithContext(ctx)
+		expiry, err := redis.Int(conn.DoContext(ctx, "PTTL", name))
+		conn.CloseContext(ctx)
 		if err != nil && err != redis.ErrNil {
 			panic(err)
 		}
@@ -135,14 +151,15 @@ func getPoolExpiries(pools []Pool, name string) []int {
 
 func clogPools(pools []Pool, mask int, mutex *Mutex) int {
 	n := 0
+	ctx := context.Background()
 	for i, pool := range pools {
 		if mask&(1<<uint(i)) == 0 {
 			n++
 			continue
 		}
-		conn := pool.Get()
-		_, err := conn.Do("SET", mutex.name, "foobar")
-		conn.Close()
+		conn := pool.GetWithContext(ctx)
+		_, err := conn.DoContext(ctx, "SET", mutex.name, "foobar")
+		conn.CloseContext(ctx)
 		if err != nil {
 			panic(err)
 		}

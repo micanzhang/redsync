@@ -1,12 +1,13 @@
 package redsync
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"sync"
 	"time"
 
-	"github.com/gomodule/redigo/redis"
+	"github.com/opencensus-integrations/redigo/redis"
 )
 
 // A DelayFunc is used to decide the amount of time to wait between retries.
@@ -33,7 +34,7 @@ type Mutex struct {
 }
 
 // Lock locks m. In case it returns an error on failure, you may retry to acquire the lock by calling this method again.
-func (m *Mutex) Lock() error {
+func (m *Mutex) Lock(ctx context.Context) error {
 	m.nodem.Lock()
 	defer m.nodem.Unlock()
 
@@ -51,7 +52,7 @@ func (m *Mutex) Lock() error {
 
 		n := 0
 		for _, pool := range m.pools {
-			ok := m.acquire(pool, value)
+			ok := m.acquire(ctx, pool, value)
 			if ok {
 				n++
 			}
@@ -64,7 +65,7 @@ func (m *Mutex) Lock() error {
 			return nil
 		}
 		for _, pool := range m.pools {
-			m.release(pool, value)
+			m.release(ctx, pool, value)
 		}
 	}
 
@@ -72,13 +73,13 @@ func (m *Mutex) Lock() error {
 }
 
 // Unlock unlocks m and returns the status of unlock.
-func (m *Mutex) Unlock() bool {
+func (m *Mutex) Unlock(ctx context.Context) bool {
 	m.nodem.Lock()
 	defer m.nodem.Unlock()
 
 	n := 0
 	for _, pool := range m.pools {
-		ok := m.release(pool, m.value)
+		ok := m.release(ctx, pool, m.value)
 		if ok {
 			n++
 		}
@@ -87,13 +88,13 @@ func (m *Mutex) Unlock() bool {
 }
 
 // Extend resets the mutex's expiry and returns the status of expiry extension.
-func (m *Mutex) Extend() bool {
+func (m *Mutex) Extend(ctx context.Context) bool {
 	m.nodem.Lock()
 	defer m.nodem.Unlock()
 
 	n := 0
 	for _, pool := range m.pools {
-		ok := m.touch(pool, m.value, int(m.expiry/time.Millisecond))
+		ok := m.touch(ctx, pool, m.value, int(m.expiry/time.Millisecond))
 		if ok {
 			n++
 		}
@@ -110,9 +111,9 @@ func (m *Mutex) genValue() (string, error) {
 	return base64.StdEncoding.EncodeToString(b), nil
 }
 
-func (m *Mutex) acquire(pool Pool, value string) bool {
-	conn := pool.Get()
-	defer conn.Close()
+func (m *Mutex) acquire(ctx context.Context, pool Pool, value string) bool {
+	conn := pool.GetWithContext(ctx)
+	defer conn.CloseContext(ctx)
 	reply, err := redis.String(conn.Do("SET", m.name, value, "NX", "PX", int(m.expiry/time.Millisecond)))
 	return err == nil && reply == "OK"
 }
@@ -125,10 +126,10 @@ var deleteScript = redis.NewScript(1, `
 	end
 `)
 
-func (m *Mutex) release(pool Pool, value string) bool {
-	conn := pool.Get()
-	defer conn.Close()
-	status, err := deleteScript.Do(conn, m.name, value)
+func (m *Mutex) release(ctx context.Context, pool Pool, value string) bool {
+	conn := pool.GetWithContext(ctx)
+	defer conn.CloseContext(ctx)
+	status, err := deleteScript.DoContext(ctx, conn, m.name, value)
 	return err == nil && status != 0
 }
 
@@ -140,9 +141,9 @@ var touchScript = redis.NewScript(1, `
 	end
 `)
 
-func (m *Mutex) touch(pool Pool, value string, expiry int) bool {
-	conn := pool.Get()
-	defer conn.Close()
-	status, err := redis.String(touchScript.Do(conn, m.name, value, expiry))
+func (m *Mutex) touch(ctx context.Context, pool Pool, value string, expiry int) bool {
+	conn := pool.GetWithContext(ctx)
+	defer conn.CloseContext(ctx)
+	status, err := redis.String(touchScript.DoContext(ctx, conn, m.name, value, expiry))
 	return err == nil && status != "ERR"
 }
